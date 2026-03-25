@@ -3,6 +3,7 @@ FastAPI wrapper for live_sketch animate_svg.py
 
 Exposes async job management for SVG sketch animation.
 Jobs run as subprocesses with progress parsing from stdout.
+Only one GPU job runs at a time (queue prevents CUDA OOM).
 """
 
 import os
@@ -53,6 +54,9 @@ class JobStatus(BaseModel):
 # In-memory job store
 jobs: Dict[str, dict] = {}
 
+# GPU lock — only one animation subprocess at a time
+_gpu_lock = asyncio.Lock()
+
 
 @app.post("/api/animate")
 async def submit_animation(request: AnimateRequest) -> dict:
@@ -85,7 +89,7 @@ async def submit_animation(request: AnimateRequest) -> dict:
         "num_iter": request.num_iter,
     }
 
-    # Launch subprocess
+    # Launch subprocess (queued — waits for GPU lock)
     asyncio.create_task(_run_animation(job_id, request))
 
     return {"jobId": job_id}
@@ -96,89 +100,111 @@ async def _run_animation(job_id: str, request: AnimateRequest) -> None:
     if not job:
         return
 
-    job_dir = Path(job["job_dir"])
-    svg_target = str(job_dir / "svg_input" / "input_scaled1")
-    output_folder = str(job_dir / "output")
+    # Wait for GPU to be free (serialises all animation jobs)
+    async with _gpu_lock:
+        # Re-check job still exists (may have been cancelled while queued)
+        job = jobs.get(job_id)
+        if not job:
+            return
 
-    cmd = [
-        "python", "-u",
-        str(ANIMATE_SCRIPT),
-        "--target", svg_target,
-        "--caption", request.caption,
-        "--output_folder", output_folder,
-        "--num_frames", str(request.num_frames),
-        "--num_iter", str(request.num_iter),
-        "--guidance_scale", str(request.guidance_scale),
-        "--save_vid_iter", "100",
-        "--optim_points", "True",
-        "--opt_points_with_mlp", "True",
-        "--lr_local", "0.005",
-        "--predict_global_frame_deltas", "1",
-        "--split_global_loss", "True",
-        "--guidance_scale_global", "40",
-        "-augment_frames", "True",
-    ]
+        job_dir = Path(job["job_dir"])
+        svg_target = str(job_dir / "svg_input" / "input_scaled1")
+        output_folder = str(job_dir / "output")
 
-    try:
-        job["status"] = "running"
-        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(LIVE_SKETCH_DIR),
-            env=env,
-        )
-        job["process"] = process
+        cmd = [
+            "python", "-u",
+            str(ANIMATE_SCRIPT),
+            "--target", svg_target,
+            "--caption", request.caption,
+            "--output_folder", output_folder,
+            "--num_frames", str(request.num_frames),
+            "--num_iter", str(request.num_iter),
+            "--guidance_scale", str(request.guidance_scale),
+            "--save_vid_iter", "100",
+            "--optim_points", "True",
+            "--opt_points_with_mlp", "True",
+            "--lr_local", "0.005",
+            "--predict_global_frame_deltas", "1",
+            "--split_global_loss", "True",
+            "--guidance_scale_global", "40",
+            "-augment_frames", "True",
+        ]
 
-        # Parse stdout for progress — match both "iteration 100" and tqdm "100/1001"
-        iteration_pattern = re.compile(r"iter[ation]*\s*[:=]?\s*(\d+)", re.IGNORECASE)
-        tqdm_pattern = re.compile(r"\s(\d+)/(\d+)\s")
-        num_iter = request.num_iter
+        try:
+            job["status"] = "running"
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(LIVE_SKETCH_DIR),
+                env=env,
+            )
+            job["process"] = process
 
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode("utf-8", errors="replace").strip()
-            if decoded:
-                print(f"[{job_id[:8]}] {decoded}")
-                match = iteration_pattern.search(decoded)
-                if match:
-                    current_iter = int(match.group(1))
-                    job["progress"] = min(int(current_iter / num_iter * 100), 99)
-                else:
+            # Parse stdout for progress
+            # tqdm: " 50%|████▉     | 100/201 [03:13..."  or  "100/201"
+            # Also match: "iteration 100" style
+            tqdm_pattern = re.compile(r"(\d+)/(\d+)\s*\[")
+            tqdm_pct_pattern = re.compile(r"(\d+)%\|")
+            iteration_pattern = re.compile(r"iter[ation]*\s*[:=]?\s*(\d+)", re.IGNORECASE)
+            num_iter = request.num_iter
+
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if decoded:
+                    print(f"[{job_id[:8]}] {decoded}")
+
+                    # Try tqdm percentage first (most reliable)
+                    match = tqdm_pct_pattern.search(decoded)
+                    if match:
+                        pct = int(match.group(1))
+                        job["progress"] = min(pct, 99)
+                        continue
+
+                    # Try tqdm current/total
                     match = tqdm_pattern.search(decoded)
                     if match:
                         current_iter = int(match.group(1))
                         total_iter = int(match.group(2))
-                        job["progress"] = min(int(current_iter / total_iter * 100), 99)
+                        if total_iter > 0:
+                            job["progress"] = min(int(current_iter / total_iter * 100), 99)
+                        continue
 
-        await process.wait()
+                    # Try "iteration N" style
+                    match = iteration_pattern.search(decoded)
+                    if match:
+                        current_iter = int(match.group(1))
+                        job["progress"] = min(int(current_iter / num_iter * 100), 99)
 
-        if process.returncode == 0:
-            gif_path = _find_result_gif(job_dir)
-            if gif_path:
-                job["status"] = "completed"
-                job["progress"] = 100
-                job["result_path"] = str(gif_path)
+            await process.wait()
+
+            if process.returncode == 0:
+                gif_path = _find_result_gif(job_dir)
+                if gif_path:
+                    job["status"] = "completed"
+                    job["progress"] = 100
+                    job["result_path"] = str(gif_path)
+                else:
+                    job["status"] = "failed"
+                    job["error"] = "Animation completed but no output GIF found"
             else:
                 job["status"] = "failed"
-                job["error"] = "Animation completed but no output GIF found"
-        else:
-            job["status"] = "failed"
-            job["error"] = f"Process exited with code {process.returncode}"
+                job["error"] = f"Process exited with code {process.returncode}"
 
-    except asyncio.CancelledError:
-        if job.get("process"):
-            job["process"].send_signal(signal.SIGTERM)
-        job["status"] = "failed"
-        job["error"] = "Job cancelled"
-    except Exception as e:
-        job["status"] = "failed"
-        job["error"] = str(e)
-    finally:
-        job["process"] = None
+        except asyncio.CancelledError:
+            if job.get("process"):
+                job["process"].send_signal(signal.SIGTERM)
+            job["status"] = "failed"
+            job["error"] = "Job cancelled"
+        except Exception as e:
+            job["status"] = "failed"
+            job["error"] = str(e)
+        finally:
+            job["process"] = None
 
 
 def _find_result_gif(job_dir: Path) -> Optional[Path]:
