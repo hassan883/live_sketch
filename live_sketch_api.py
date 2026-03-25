@@ -12,7 +12,7 @@ import shutil
 import signal
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,7 +51,7 @@ class JobStatus(BaseModel):
 
 
 # In-memory job store
-jobs: dict[str, dict] = {}
+jobs: Dict[str, dict] = {}
 
 
 @app.post("/api/animate")
