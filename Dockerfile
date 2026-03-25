@@ -54,6 +54,12 @@ RUN pip install --no-cache-dir \
     svgpathtools \
     xformers
 
+# Install FastAPI for API server mode
+RUN pip install --no-cache-dir \
+    "fastapi>=0.104.0" \
+    "uvicorn[standard]>=0.24.0" \
+    "python-multipart>=0.0.6"
+
 # Copy diffvg and build it
 COPY diffvg/ /app/diffvg/
 
@@ -68,5 +74,10 @@ RUN cd /app/diffvg && \
 # Copy the rest of the project
 COPY . /app/
 
-# Default entrypoint
-ENTRYPOINT ["python", "animate_svg.py"]
+# Create output directories
+RUN mkdir -p job_outputs output_videos
+
+EXPOSE 8000
+
+# Default: run API server. Override with "python animate_svg.py ..." for CLI mode
+CMD ["python", "-m", "uvicorn", "live_sketch_api:app", "--host", "0.0.0.0", "--port", "8000"]
