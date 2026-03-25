@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+*.egg-info
+build/
+dist/
+.git
+*.mp4
+output/
+wandb/
+diffvg/build/
+diffvg/dist/
+diffvg/*.egg-info
+diffvg/diffvg.egg-info/
