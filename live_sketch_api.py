@@ -109,7 +109,9 @@ async def _run_animation(job_id: str, request: AnimateRequest) -> None:
 
         job_dir = Path(job["job_dir"])
         svg_target = str(job_dir / "svg_input" / "input_scaled1")
-        output_folder = str(job_dir / "output")
+        # animate_svg.py prepends "./output_videos/" to output_folder,
+        # so pass just the job_id to get ./output_videos/{job_id}/
+        output_folder = job_id
 
         cmd = [
             "python", "-u",
@@ -183,7 +185,7 @@ async def _run_animation(job_id: str, request: AnimateRequest) -> None:
             await process.wait()
 
             if process.returncode == 0:
-                gif_path = _find_result_gif(job_dir)
+                gif_path = _find_result_gif(job_dir, job_id)
                 if gif_path:
                     job["status"] = "completed"
                     job["progress"] = 100
@@ -207,12 +209,19 @@ async def _run_animation(job_id: str, request: AnimateRequest) -> None:
             job["process"] = None
 
 
-def _find_result_gif(job_dir: Path) -> Optional[Path]:
-    """Search for the output GIF in the job directory."""
-    for pattern in ["**/*HQ_gif.gif", "**/*.gif", "**/*.mp4"]:
-        matches = list(job_dir.glob(pattern))
-        if matches:
-            return matches[0]
+def _find_result_gif(job_dir: Path, job_id: str) -> Optional[Path]:
+    """Search for the output GIF in the job directory and output_videos."""
+    # animate_svg.py saves to ./output_videos/{job_id}/HQ_gif.gif
+    output_videos_dir = LIVE_SKETCH_DIR / "output_videos" / job_id
+    search_dirs = [output_videos_dir, job_dir]
+
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for pattern in ["**/*HQ_gif.gif", "**/*.gif", "**/*.mp4"]:
+            matches = list(search_dir.glob(pattern))
+            if matches:
+                return matches[0]
     return None
 
 
